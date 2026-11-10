@@ -15,8 +15,8 @@ if(APPLE)
 endif()
 
 juce_add_plugin(TapeHalt
-  COMPANY_NAME "Demo"
-  PLUGIN_MANUFACTURER_CODE Demo
+  COMPANY_NAME "BoodmanFX"
+  PLUGIN_MANUFACTURER_CODE Bdmn
   PLUGIN_CODE Thlt
   FORMATS ${FORMATS}
   PRODUCT_NAME "TapeHalt"

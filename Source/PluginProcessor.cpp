@@ -3,6 +3,7 @@
 
 const juce::StringArray TapeHaltProcessor::modeNames { "Classic", "Modern", "Loop" };
 const juce::StringArray TapeHaltProcessor::loopNames { "1/32", "1/16", "1/8", "1/4", "1/2" };
+const juce::StringArray TapeHaltProcessor::stopLenNames { "1/8", "1/4", "1/2", "1 BAR", "2 BARS", "4 BARS" };
 
 TapeHaltProcessor::TapeHaltProcessor()
     : AudioProcessor (BusesProperties()
@@ -10,16 +11,21 @@ TapeHaltProcessor::TapeHaltProcessor()
                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "STATE", createLayout())
 {
+    for (auto& b : waveBins) b.store (0.f);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout TapeHaltProcessor::createLayout()
 {
+    using juce::ParameterID;
     juce::AudioProcessorValueTreeState::ParameterLayout l;
-    // 1 = vitesse normale, 0 = bande à l'arrêt. Automatisable dans la DAW.
-    l.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "pitch", 1 }, "Pitch",
+    l.add (std::make_unique<juce::AudioParameterFloat> (ParameterID { "pitch", 1 }, "Pitch",
                                                         juce::NormalisableRange<float> (0.f, 1.f, 0.0001f), 1.f));
-    l.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { "mode", 1 }, "Mode", modeNames, 0));
-    l.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { "loop", 1 }, "Loop Length", loopNames, 1));
+    l.add (std::make_unique<juce::AudioParameterChoice> (ParameterID { "mode", 1 }, "Mode", modeNames, 0));
+    l.add (std::make_unique<juce::AudioParameterChoice> (ParameterID { "loop", 1 }, "Loop Length", loopNames, 1));
+    l.add (std::make_unique<juce::AudioParameterBool>   (ParameterID { "stop", 1 }, "Stop", false));
+    l.add (std::make_unique<juce::AudioParameterChoice> (ParameterID { "stopLen", 1 }, "Stop Length", stopLenNames, 3));
+    l.add (std::make_unique<juce::AudioParameterFloat>  (ParameterID { "curve", 1 }, "Curve",
+                                                         juce::NormalisableRange<float> (-100.f, 100.f, 1.f), 0.f));
     return l;
 }
 
@@ -41,9 +47,14 @@ void TapeHaltProcessor::prepareToPlay (double rate, int)
         c.loop.assign ((size_t) ringSize, 0.f);
         c.w = 0; c.delay = 0; c.phase = 0; c.loopPos = 0;
     }
-    speed = 1.f; wet = 0.f; running = false;
+    speed = 1.f; wet = 0.f; running = false; rampPos = 0.f;
     speedCoef = 1.f - std::exp (-1.f / (0.003f * (float) rate));
     wetCoef   = 1.f - std::exp (-1.f / (0.010f * (float) rate));
+
+    waveBinSamples = juce::jmax (64, (int) (rate * 0.012));
+    waveAcc = 0.f; waveCount = 0; waveHead.store (0);
+    for (auto& b : waveBins) b.store (0.f);
+    uiSpeed.store (1.f); uiLoopPos.store (-1.f);
 }
 
 void TapeHaltProcessor::engage()
@@ -51,7 +62,7 @@ void TapeHaltProcessor::engage()
     for (auto& c : ch)
     {
         c.delay = 0; c.phase = 0; c.loopPos = 0;
-        for (int k = 0; k < loopLen; ++k)           // instantané des derniers loopLen samples
+        for (int k = 0; k < loopLen; ++k)
             c.loop[(size_t) k] = c.ring[(size_t) (((c.w - loopLen + k) % ringSize + ringSize) % ringSize)];
     }
 }
@@ -71,31 +82,48 @@ void TapeHaltProcessor::processBlock (juce::AudioBuffer<float>& buf, juce::MidiB
     const int n = buf.getNumSamples();
     const int nch = juce::jmin (buf.getNumChannels(), 2);
 
-    const float pitch = apvts.getRawParameterValue ("pitch")->load();
-    const int   mode  = (int) apvts.getRawParameterValue ("mode")->load();
-    const int   loopI = (int) apvts.getRawParameterValue ("loop")->load();
+    auto get = [this] (const char* id) { return apvts.getRawParameterValue (id)->load(); };
+    const float pitch  = get ("pitch");
+    const int   mode   = (int) get ("mode");
+    const int   loopI  = (int) get ("loop");
+    const bool  stopOn = get ("stop") > 0.5f;
+    const int   stopI  = juce::jlimit (0, 5, (int) get ("stopLen"));
+    const float k      = std::pow (4.f, get ("curve") / 100.f);   // 1 = linéaire
 
-    double bpm = 120.0;
+    double bpm = 120.0, beatsPerBar = 4.0;
     if (auto* ph = getPlayHead())
         if (auto pos = ph->getPosition())
+        {
             if (auto b = pos->getBpm()) bpm = *b;
-    static const double beats[] { 0.125, 0.25, 0.5, 1.0, 2.0 };
-    const int wantedLoop = juce::jlimit (64, ringSize - 8, (int) (beats[juce::jlimit (0, 4, loopI)] * 60.0 / bpm * sr));
+            if (auto ts = pos->getTimeSignature())
+                if (ts->denominator > 0) beatsPerBar = ts->numerator * 4.0 / ts->denominator;
+        }
+    bpm = juce::jmax (20.0, bpm);
 
-    const bool engaged = pitch < 0.995f;
-    const float target = engaged ? pitch : 1.f;
+    static const double loopBeats[] { 0.125, 0.25, 0.5, 1.0, 2.0 };
+    const int wantedLoop = juce::jlimit (64, ringSize - 8,
+                                         (int) (loopBeats[juce::jlimit (0, 4, loopI)] * 60.0 / bpm * sr));
+
+    static const double stopBeats[] { 0.5, 1.0, 2.0, -1.0, -2.0, -4.0 };  // négatif = nombre de mesures
+    const double beats = stopBeats[stopI] > 0 ? stopBeats[stopI] : -stopBeats[stopI] * beatsPerBar;
+    const float rampInc = (float) (1.0 / juce::jmax (1.0, beats * 60.0 / bpm * sr));
+
     const float G = (float) grain;
 
     for (int i = 0; i < n; ++i)
     {
-        speed += speedCoef * (target - speed);
+        rampPos = juce::jlimit (0.f, 1.f, rampPos + (stopOn ? rampInc : -rampInc));
+        const float target  = pitch * (1.f - std::pow (rampPos, k));
+        const bool  engaged = target < 0.995f;
+
+        speed += speedCoef * ((engaged ? target : 1.f) - speed);
         wet   += wetCoef * ((engaged ? 1.f : 0.f) - wet);
 
         if (! running && engaged) { loopLen = wantedLoop; engage(); running = true; }
         else if (running && ! engaged && wet < 0.001f) running = false;
 
-        // fondu vers le silence quand la bande est (presque) arrêtée, évite un DC
         const float amp = juce::jlimit (0.f, 1.f, speed * 10.f);
+        float peak = 0.f;
 
         for (int c = 0; c < nch; ++c)
         {
@@ -107,12 +135,12 @@ void TapeHaltProcessor::processBlock (juce::AudioBuffer<float>& buf, juce::MidiB
             float w = dry;
             if (running)
             {
-                if (mode == 0) // Classic : pitch ET temps ralentissent ensemble
+                if (mode == 0)
                 {
                     s.delay = juce::jmin (s.delay + (1.f - speed), (float) (ringSize - 4));
                     w = readLinear (s.ring, (float) s.w - s.delay, ringSize);
                 }
-                else if (mode == 1) // Modern : pitch baisse, le temps continue (2 grains croisés)
+                else if (mode == 1)
                 {
                     s.phase += (1.f - speed) / G;
                     s.phase -= std::floor (s.phase);
@@ -122,7 +150,7 @@ void TapeHaltProcessor::processBlock (juce::AudioBuffer<float>& buf, juce::MidiB
                     w = readLinear (s.ring, (float) s.w - s.phase * G, ringSize) * w1 * w1
                       + readLinear (s.ring, (float) s.w - p2 * G,      ringSize) * w2 * w2;
                 }
-                else // Loop : boucle sur les derniers instants, lue à vitesse variable
+                else
                 {
                     s.loopPos += speed;
                     if (s.loopPos >= (float) loopLen) s.loopPos -= (float) loopLen;
@@ -130,9 +158,22 @@ void TapeHaltProcessor::processBlock (juce::AudioBuffer<float>& buf, juce::MidiB
                 }
             }
             d[i] = dry * (1.f - wet) + w * amp * wet;
+            peak = juce::jmax (peak, std::abs (d[i]));
             s.w = (s.w + 1) % ringSize;
         }
+
+        waveAcc = juce::jmax (waveAcc, peak);
+        if (++waveCount >= waveBinSamples)
+        {
+            const int h = waveHead.load();
+            waveBins[(size_t) h].store (waveAcc);
+            waveHead.store ((h + 1) % numWaveBins);
+            waveAcc = 0.f; waveCount = 0;
+        }
     }
+
+    uiSpeed.store (speed);
+    uiLoopPos.store ((running && mode == 2 && loopLen > 0) ? ch[0].loopPos / (float) loopLen : -1.f);
 }
 
 juce::AudioProcessorEditor* TapeHaltProcessor::createEditor() { return new TapeHaltEditor (*this); }
